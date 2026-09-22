@@ -12,7 +12,7 @@ namespace CmToggle
     // Always-visible on-screen button that opens/closes ConfigurationManager via IMGUI
     // clicks (independent of the keyboard backend). All appearance options are exposed
     // as ConfigurationManager settings so they can be edited live in the CM window.
-    [BepInPlugin(PluginGuid, "CM Button Toggle", "4.0.0")]
+    [BepInPlugin(PluginGuid, "CM Button Toggle", "1.0.0")]
     [BepInDependency(CmGuid)]
     public class CmTogglePlugin : BaseUnityPlugin
     {
@@ -24,8 +24,7 @@ namespace CmToggle
         private static ManualLogSource Log;
 
         // ---- Behaviour / text ----
-        private ConfigEntry<string> _openText;
-        private ConfigEntry<string> _closeText;
+        private ConfigEntry<string> _buttonText;
 
         // ---- Size / font ----
         private ConfigEntry<float> _buttonWidth;
@@ -58,9 +57,9 @@ namespace CmToggle
 
         // ---- Style caches ----
         private GUIStyle _style;
-        private Texture2D _bgTex, _borderTex;
-        private Color _lastBg, _lastBorderCol;
+        private Texture2D _bgTex, _borderTex, _clearTex;
         private int _lastRadius = -1;
+        private float _lastBorderThickness = -1f;
         private Texture2D _roundedBg, _roundedBorder;
         private Dictionary<string, Font> _fontLookup;
         private readonly Dictionary<string, Font> _dynamicFontCache = new Dictionary<string, Font>();
@@ -73,10 +72,8 @@ namespace CmToggle
             BuildFontList();
             string defaultFont = "Default";
 
-            _openText = Config.Bind("1 - Behaviour", "Open label", "Open Config",
-                "Button text when the config window is closed.");
-            _closeText = Config.Bind("1 - Behaviour", "Close label", "Close Config",
-                "Button text when the config window is open.");
+            _buttonText = Config.Bind("1 - Label", "Button label", "Config",
+                "Text shown on the button.");
 
             _buttonWidth = Config.Bind("2 - Size & Font", "Width", 130f,
                 new ConfigDescription("Button width (px).", new AcceptableValueRange<float>(40f, 500f)));
@@ -183,34 +180,78 @@ namespace CmToggle
             return t;
         }
 
-        // Generate a rounded-rectangle texture (white, alpha mask) for the given size/radius.
+        // Continuous rounded-rect distance field (negative = inside the shape, 0 = on the
+        // boundary, positive = outside). p is relative to the rect's center; halfW/halfH are
+        // the rect's half extents; radius is the corner radius. Standard "SDF rounded box"
+        // formula — this is what lets us anti-alias the curved corners instead of doing a
+        // hard per-pixel inside/outside circle test (which is what produced jagged corners).
+        private static float RoundedBoxSDF(float px, float py, float halfW, float halfH, float radius)
+        {
+            float qx = Mathf.Abs(px) - halfW + radius;
+            float qy = Mathf.Abs(py) - halfH + radius;
+            float mx = Mathf.Max(qx, 0f), my = Mathf.Max(qy, 0f);
+            return Mathf.Sqrt(mx * mx + my * my) + Mathf.Min(Mathf.Max(qx, qy), 0f) - radius;
+        }
+
+        // Converts a signed distance into 0..1 coverage with a ~1px soft edge, instead of a
+        // hard cutoff at distance 0. This is the actual anti-aliasing step.
+        private static float CoverageFromSDF(float dist) => Mathf.Clamp01(0.5f - dist);
+
+        // Generate an anti-aliased rounded-rectangle texture (alpha mask) for the given size/radius.
         private static Texture2D RoundedTex(int w, int h, int radius, Color color)
         {
             w = Mathf.Max(1, w); h = Mathf.Max(1, h);
             radius = Mathf.Clamp(radius, 0, Mathf.Min(w, h) / 2);
+            float halfW = w / 2f, halfH = h / 2f;
+
             var tex = new Texture2D(w, h, TextureFormat.ARGB32, false);
             var pixels = new Color[w * h];
             for (int y = 0; y < h; y++)
             {
                 for (int x = 0; x < w; x++)
                 {
-                    bool inside = true;
-                    if (radius > 0)
-                    {
-                        // distance check only in the four corner boxes
-                        int cx = -1, cy = -1;
-                        if (x < radius && y < radius) { cx = radius; cy = radius; }
-                        else if (x >= w - radius && y < radius) { cx = w - radius - 1; cy = radius; }
-                        else if (x < radius && y >= h - radius) { cx = radius; cy = h - radius - 1; }
-                        else if (x >= w - radius && y >= h - radius) { cx = w - radius - 1; cy = h - radius - 1; }
+                    float px = (x + 0.5f) - halfW;
+                    float py = (y + 0.5f) - halfH;
+                    float a = CoverageFromSDF(RoundedBoxSDF(px, py, halfW, halfH, radius));
+                    pixels[y * w + x] = new Color(color.r, color.g, color.b, color.a * a);
+                }
+            }
+            tex.SetPixels(pixels);
+            tex.Apply();
+            return tex;
+        }
 
-                        if (cx >= 0)
-                        {
-                            float dx = x - cx, dy = y - cy;
-                            inside = (dx * dx + dy * dy) <= (radius * radius);
-                        }
-                    }
-                    pixels[y * w + x] = inside ? color : new Color(0, 0, 0, 0);
+        // Anti-aliased hollow ring mask: coverage is (outer shape coverage) minus (inset
+        // shape coverage), each computed from its own distance field. Subtracting two soft
+        // 0..1 coverage values this way gives a clean soft edge on BOTH the outer and inner
+        // boundary of the ring, not just the outer one.
+        private static Texture2D RoundedRingTex(int w, int h, int outerRadius, int thickness, Color color)
+        {
+            w = Mathf.Max(1, w); h = Mathf.Max(1, h);
+            outerRadius = Mathf.Clamp(outerRadius, 0, Mathf.Min(w, h) / 2);
+            int t = Mathf.Clamp(thickness, 0, Mathf.Min(w, h) / 2);
+            int innerRadius = Mathf.Max(0, outerRadius - t);
+
+            float halfW = w / 2f, halfH = h / 2f;
+            float innerHalfW = halfW - t, innerHalfH = halfH - t;
+
+            var tex = new Texture2D(w, h, TextureFormat.ARGB32, false);
+            var pixels = new Color[w * h];
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    float px = (x + 0.5f) - halfW;
+                    float py = (y + 0.5f) - halfH;
+
+                    float outerA = CoverageFromSDF(RoundedBoxSDF(px, py, halfW, halfH, outerRadius));
+
+                    float innerA = 0f;
+                    if (t > 0 && innerHalfW > 0f && innerHalfH > 0f)
+                        innerA = CoverageFromSDF(RoundedBoxSDF(px, py, innerHalfW, innerHalfH, innerRadius));
+
+                    float ringA = Mathf.Clamp01(outerA - innerA);
+                    pixels[y * w + x] = new Color(color.r, color.g, color.b, color.a * ringA);
                 }
             }
             tex.SetPixels(pixels);
@@ -251,38 +292,47 @@ namespace CmToggle
             int w = Mathf.RoundToInt(_buttonWidth.Value);
             int h = Mathf.RoundToInt(_buttonHeight.Value);
             int r = _cornerRadius.Value;
+            float bt = _borderThickness.Value;
 
-            bool rebuildRounded = (_roundedBg == null) || _lastRadius != r ||
-                                   _lastBg != _buttonColor.Value || _lastBorderCol != _borderColor.Value ||
+            bool rebuildRounded = (_roundedBg == null) || _lastRadius != r || _lastBorderThickness != bt ||
                                    _roundedBg.width != w || _roundedBg.height != h;
 
             if (r > 0 && rebuildRounded)
             {
-                _roundedBg = RoundedTex(w, h, r, Color.white);     // white mask, tinted at draw time
-                _roundedBorder = RoundedTex(w, h, r, Color.white);
+                _roundedBg = RoundedTex(w, h, r, Color.white);                                   // solid fill mask
+                _roundedBorder = RoundedRingTex(w, h, r, Mathf.RoundToInt(bt), Color.white);      // hollow ring mask
                 _lastRadius = r;
+                _lastBorderThickness = bt;
             }
 
-            if (_bgTex == null || _lastBg != _buttonColor.Value)
-            {
-                _bgTex = SolidTex(_buttonColor.Value);
-                _lastBg = _buttonColor.Value;
-            }
-            if (_borderTex == null || _lastBorderCol != _borderColor.Value)
-            {
-                _borderTex = SolidTex(_borderColor.Value);
-                _lastBorderCol = _borderColor.Value;
-            }
+            // Plain white 1x1 textures, created once. Color + alpha are applied a single
+            // time via GUI.color in DrawRect(). Previously these were baked with the
+            // actual button/border color AND then tinted again by the same color in
+            // DrawRect, which squared both the RGB and the Alpha (color*color, alpha*alpha) —
+            // that's why lowering Alpha just made the button darker/grayer instead of
+            // letting the background show through.
+            if (_bgTex == null) _bgTex = SolidTex(Color.white);
+            if (_borderTex == null) _borderTex = SolidTex(Color.white);
 
             // Make GUI.Button itself transparent; we draw the fill ourselves so rounding works.
-            var clear = SolidTex(new Color(0, 0, 0, 0));
-            _style.normal.background = clear;
-            _style.hover.background = clear;
-            _style.active.background = clear;
+            // Every background state needs overriding, not just normal/hover/active — once
+            // the button is clicked it becomes the keyboard-focused control and Unity draws
+            // it with the "focused" state instead, which otherwise falls back to the default
+            // skin's built-in (opaque light gray) button texture regardless of _buttonColor.
+            if (_clearTex == null) _clearTex = SolidTex(new Color(0, 0, 0, 0));
+            _style.normal.background = _clearTex;
+            _style.hover.background = _clearTex;
+            _style.active.background = _clearTex;
+            _style.focused.background = _clearTex;
+            _style.onNormal.background = _clearTex;
+            _style.onHover.background = _clearTex;
+            _style.onActive.background = _clearTex;
+            _style.onFocused.background = _clearTex;
 
             _style.normal.textColor = _textColor.Value;
             _style.hover.textColor = _textColor.Value;
             _style.active.textColor = _textColor.Value;
+            _style.focused.textColor = _textColor.Value;
             _style.fontSize = Mathf.RoundToInt(_fontSize.Value);
             _style.alignment = TextAnchor.MiddleCenter;
             _style.contentOffset = new Vector2(_textXOffset.Value, _textYOffset.Value);
@@ -342,28 +392,41 @@ namespace CmToggle
 
             if (r > 0 && _roundedBorder != null && _roundedBg != null)
             {
-                // Border = larger rounded rect; fill = inset rounded rect.
+                // Border = hollow ring mask (already excludes the middle); fill = inset rect.
                 if (bt > 0)
                     DrawRect(_buttonRect, _roundedBorder, _borderColor.Value);
                 Rect inner = new Rect(_buttonRect.x + bt, _buttonRect.y + bt,
-                                      _buttonRect.width - bt * 2, _buttonRect.height - bt * 2);
+                                      Mathf.Max(0f, _buttonRect.width - bt * 2), Mathf.Max(0f, _buttonRect.height - bt * 2));
                 DrawRect(inner, _roundedBg, _buttonColor.Value);
             }
             else
             {
-                // Sharp corners: simple rects.
+                // Sharp corners: draw the border as four non-overlapping strips forming a
+                // true frame. Previously this drew one full-size rect for the border, then
+                // relied on the opaque fill rect on top to visually cover the middle — which
+                // only worked when the fill was fully opaque. With a translucent (or fully
+                // transparent) fill, the border rect underneath showed through the whole
+                // button instead of just its edges. Strips fix that: the border texture
+                // itself is never present in the middle, so the fill's alpha can't matter.
                 if (bt > 0)
-                    DrawRect(_buttonRect, _borderTex, _borderColor.Value);
+                {
+                    float ih = Mathf.Max(0f, _buttonRect.height - bt * 2);
+                    var top = new Rect(_buttonRect.x, _buttonRect.y, _buttonRect.width, bt);
+                    var bottom = new Rect(_buttonRect.x, _buttonRect.y + _buttonRect.height - bt, _buttonRect.width, bt);
+                    var left = new Rect(_buttonRect.x, _buttonRect.y + bt, bt, ih);
+                    var right = new Rect(_buttonRect.x + _buttonRect.width - bt, _buttonRect.y + bt, bt, ih);
+                    DrawRect(top, _borderTex, _borderColor.Value);
+                    DrawRect(bottom, _borderTex, _borderColor.Value);
+                    DrawRect(left, _borderTex, _borderColor.Value);
+                    DrawRect(right, _borderTex, _borderColor.Value);
+                }
                 Rect inner = new Rect(_buttonRect.x + bt, _buttonRect.y + bt,
-                                      _buttonRect.width - bt * 2, _buttonRect.height - bt * 2);
+                                      Mathf.Max(0f, _buttonRect.width - bt * 2), Mathf.Max(0f, _buttonRect.height - bt * 2));
                 DrawRect(inner, _bgTex, _buttonColor.Value);
             }
 
-            bool isOpen = (bool)_displayingWindowProp.GetValue(_cm, null);
-            string label = isOpen ? _closeText.Value : _openText.Value;
-
             // Transparent button on top handles the click + draws the label.
-            if (GUI.Button(_buttonRect, label, _style))
+            if (GUI.Button(_buttonRect, _buttonText.Value, _style))
                 ToggleWindow();
         }
     }
